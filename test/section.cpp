@@ -23,7 +23,7 @@ along with Manalyze.  If not, see <http://www.gnu.org/licenses/>.
 
 BOOST_AUTO_TEST_CASE(section_invalid_args)
 {
-	mana::image_section_header h;
+	mana::image_section_header h = {0};
 	mana::Section s(h, nullptr, 0);
 
 	auto res = s.get_raw_data();

@@ -144,7 +144,7 @@ bool validate_args(po::variables_map& vm, po::options_description& desc, char** 
 	{
 		std::vector<std::string> selected_categories = tokenize_args(vm["dump"].as<std::vector<std::string> >());
 		const std::vector<std::string> categories = boost::assign::list_of("all")("summary")("dos")("pe")("opt")("sections")
-			("imports")("exports")("resources")("version")("debug")("tls")("config")("delay");
+			("imports")("exports")("resources")("version")("debug")("tls")("config")("delay")("rich");
 		for (auto it = selected_categories.begin() ; it != selected_categories.end() ; ++it)
 		{
 			std::vector<std::string>::const_iterator found = std::find(categories.begin(), categories.end(), *it);
@@ -233,7 +233,7 @@ bool parse_args(po::variables_map& vm, int argc, char**argv)
 			"Dump PE information. Available choices are any combination of: "
 			"all, summary, dos (dos header), pe (pe header), opt (pe optional header), sections, "
 			"imports, exports, resources, version, debug, tls, config (image load configuration), "
-			"delay (delay-load table")
+			"delay (delay-load table), rich")
 		("hashes", "Calculate various hashes of the file (may slow down the analysis!)")
 		("extract,x", po::value<std::string>(), "Extract the PE resources and authenticode certificates "
 			"to the target directory.")
@@ -282,7 +282,7 @@ bool parse_args(po::variables_map& vm, int argc, char**argv)
 /**
  *	@brief	Dumps select information from a PE.
  *
- *	@param	io::OutputFormatter& formatter The object which will recieve the output.
+ *	@param	io::OutputFormatter& formatter The object which will receive the output.
  *	@param	const std::vector<std::string>& categories The types of information to dump.
  *			For the list of accepted categories, refer to the program help or the source
  *			below.
@@ -295,8 +295,7 @@ void handle_dump_option(io::OutputFormatter& formatter, const std::vector<std::s
 	if (dump_all || std::find(categories.begin(), categories.end(), "summary") != categories.end()) {
 		mana::dump_summary(pe, formatter);
 	}
-	if (dump_all || std::find(categories.begin(), categories.end(), "dos") != categories.end())
-	{
+	if (dump_all || std::find(categories.begin(), categories.end(), "dos") != categories.end())	{
 		mana::dump_dos_header(pe, formatter);
 	}
 	if (dump_all || std::find(categories.begin(), categories.end(), "pe") != categories.end()) {
@@ -332,6 +331,9 @@ void handle_dump_option(io::OutputFormatter& formatter, const std::vector<std::s
 	if (dump_all || std::find(categories.begin(), categories.end(), "delay") != categories.end()) {
 		mana::dump_dldt(pe, formatter);
 	}
+	if (dump_all || std::find(categories.begin(), categories.end(), "rich") != categories.end()) {
+		mana::dump_rich_header(pe, formatter);
+	}
 }
 
 // ----------------------------------------------------------------------------
@@ -339,7 +341,7 @@ void handle_dump_option(io::OutputFormatter& formatter, const std::vector<std::s
 /**
  *	@brief	Analyze the PE with each selected plugin.
  *
- *	@param	io::OutputFormatter& formatter The object which will recieve the output.
+ *	@param	io::OutputFormatter& formatter The object which will receive the output.
  *	@param	const std::vector<std::string>& selected The names of the selected plugins.
  *	@param	const config& conf The configuration of the plugins.
  *	@param	const mana::PE& pe The PE to analyze.
@@ -353,7 +355,7 @@ void handle_plugins_option(io::OutputFormatter& formatter,
 	std::vector<plugin::pIPlugin> plugins = plugin::PluginManager::get_instance().get_plugins();
 	io::pNode plugins_node(new io::OutputTreeNode("Plugins", io::OutputTreeNode::LIST));
 
-	for (std::vector<plugin::pIPlugin>::iterator it = plugins.begin() ; it != plugins.end() ; ++it)
+	for (auto it = plugins.begin() ; it != plugins.end() ; ++it)
 	{
 		// Verify that the plugin was selected
 		if (!all_plugins && std::find(selected.begin(), selected.end(), *(*it)->get_id()) == selected.end()) {
@@ -481,9 +483,9 @@ void perform_analysis(const std::string& path,
 			yara::const_matches m = y.scan_file(*pe.get_path());
 			if (m && m->size() > 0)
 			{
-				std::cerr << "Detected file type(s):" << std::endl;
+				std::cerr << "Detected file type(s):\t" << std::endl;
 				for (auto it = m->begin() ; it != m->end() ; ++it) {
-					std::cerr << "\t" << (*it)->operator[]("description") << std::endl;
+					std::cerr << (*it)->operator[]("description") << std::endl;
 				}
 			}
 		}

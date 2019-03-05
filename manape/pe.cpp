@@ -111,6 +111,52 @@ shared_bytes PE::get_raw_bytes(size_t size) const
 
 // ----------------------------------------------------------------------------
 
+shared_bytes PE::get_overlay_bytes(size_t size) const
+{
+    if (_file_handle == nullptr || !_ioh || size == 0) {
+        return nullptr;
+    }
+
+    const auto sections = get_sections();
+    if (!sections) {
+        return nullptr;
+    }
+
+    // Find where the overlay data would be located.
+    boost::uint64_t max_offset = 0;
+
+    // If the binary is signed, look after the authenticode signature.
+    if (_ioh->directories[IMAGE_DIRECTORY_ENTRY_SECURITY].VirtualAddress) 
+    {
+        max_offset = _ioh->directories[IMAGE_DIRECTORY_ENTRY_SECURITY].VirtualAddress + 
+            _ioh->directories[IMAGE_DIRECTORY_ENTRY_SECURITY].Size;
+    }
+    else // Otherwise, look after the last section.
+    {
+        for (const auto& it : *sections)
+        {
+            if (it->get_pointer_to_raw_data() + it->get_size_of_raw_data() > max_offset) {
+                max_offset = it->get_pointer_to_raw_data() + it->get_size_of_raw_data();
+            }
+        }
+    }
+
+    // The PE has no overlay data.
+    if (max_offset >= get_filesize()) {
+        return nullptr;
+    }
+
+    fseek(_file_handle.get(), max_offset, SEEK_SET);
+    if (size > _file_size - max_offset) {
+        size = static_cast<size_t>(_file_size - max_offset);
+    }
+    auto res = boost::make_shared<std::vector<boost::uint8_t> >(size);
+    fread(&(*res)[0], 1, size, _file_handle.get());
+    return res;
+}
+
+// ----------------------------------------------------------------------------
+
 bool PE::_parse_dos_header()
 {
 	if (_file_handle == nullptr) {
@@ -211,8 +257,8 @@ bool PE::_parse_coff_symbols()
 	}
 
 	// Read the COFF string table
-	boost::uint32_t st_size = 0;
-	boost::uint32_t count = 0;
+	size_t st_size = 0;
+	size_t count = 0;
 	fread(&st_size, 4, 1, _file_handle.get());
 	if (st_size > get_filesize() - ftell(_file_handle.get())) // Weak error check, but I couldn't find a better one in the PE spec.
 	{
@@ -467,17 +513,17 @@ unsigned int PE::rva_to_offset(boost::uint64_t rva) const
 	}
 
 	// Special case: PE with no sections
-	if (_sections.size() == 0) {
-		return rva & 0xFFFFFFFF; // If the file is bigger than 4Go, this assumption may not be true.
+	if (_sections.empty()) {
+		return rva & 0xFFFFFFFF; // If the file is bigger than 4GB, this assumption may not be true.
 	}
 
 	// Find the corresponding section.
 	pSection section = pSection();
-	for (std::vector<pSection>::const_iterator it = _sections.begin() ; it != _sections.end() ; ++it)
+	for (const auto& it : _sections)
 	{
-		if (is_address_in_section(rva, *it))
+		if (is_address_in_section(rva, it))
 		{
-			section = *it;
+			section = it;
 			break;
 		}
 	}
@@ -485,11 +531,11 @@ unsigned int PE::rva_to_offset(boost::uint64_t rva) const
 	if (section == nullptr)
 	{
 		// No section found. Maybe the VirsualSize is erroneous? Try with the RawSizeOfData.
-		for (std::vector<pSection>::const_iterator it = _sections.begin() ; it != _sections.end() ; ++it)
+		for (const auto& it : _sections)
 		{
-			if (is_address_in_section(rva, *it, true))
+			if (is_address_in_section(rva, it, true))
 			{
-				section = *it;
+				section = it;
 				break;
 			}
 		}
@@ -547,7 +593,7 @@ bool PE::_reach_directory(int directory) const
 	{
 		PRINT_ERROR << "Tried to reach a directory, but ImageOptionalHeader was not parsed!"
 					<< DEBUG_INFO_INSIDEPE << std::endl;
-		return 0;
+		return false;
 	}
 
 	if (_ioh->directories[directory].VirtualAddress == 0 && _ioh->directories[directory].Size == 0) {
@@ -592,7 +638,8 @@ bool PE::_parse_directories()
 		   _parse_relocations() &&
 		   _parse_tls() &&
 		   _parse_config() &&
-		   _parse_certificates();
+		   _parse_certificates() &&
+		   _parse_rich_header();
 }
 
 // ----------------------------------------------------------------------------
@@ -618,41 +665,43 @@ bool PE::_parse_exports()
 		return false;
 	}
 
-	if (ied.Characteristics != 0) {
+    _ied.reset(ied);
+
+	if (_ied->Characteristics != 0) {
 		PRINT_WARNING << "IMAGE_EXPORT_DIRECTORY field Characteristics is reserved and should be 0!"
 					  << DEBUG_INFO_INSIDEPE << std::endl; // TODO: Move to structural plugin?
 	}
-	if (ied.NumberOfFunctions == 0) {
+	if (_ied->NumberOfFunctions == 0) {
 		return true; // No exports
 	}
 
 	// Read the export name
-	unsigned int offset = rva_to_offset(ied.Name);
-	if (!offset || !utils::read_string_at_offset(_file_handle.get(), offset, ied.NameStr))
+	unsigned int offset = rva_to_offset(_ied->Name);
+	if (!offset || !utils::read_string_at_offset(_file_handle.get(), offset, _ied->NameStr))
 	{
 		PRINT_ERROR << "Could not read the exported DLL name." << DEBUG_INFO_INSIDEPE << std::endl;
-		return false;
+		return true;
 	}
 
 	// Get the address and ordinal of each exported function
-	offset = rva_to_offset(ied.AddressOfFunctions);
+	offset = rva_to_offset(_ied->AddressOfFunctions);
 	if (!offset || fseek(_file_handle.get(), offset, SEEK_SET))
 	{
 		PRINT_ERROR << "Could not reach exported functions address table."
 					<< DEBUG_INFO_INSIDEPE << std::endl;
-		return false;
+		return true;
 	}
 
-	for (unsigned int i = 0 ; i < ied.NumberOfFunctions ; ++i)
+	for (unsigned int i = 0 ; i < _ied->NumberOfFunctions ; ++i)
 	{
 		pexported_function ex = boost::make_shared<exported_function>();
 		if (4 != fread(&(ex->Address), 1, 4, _file_handle.get()))
 		{
 			PRINT_ERROR << "Could not read an exported function's address."
 						<< DEBUG_INFO_INSIDEPE << std::endl;
-			return false;
+			return true;
 		}
-		ex->Ordinal = ied.Base + i;
+		ex->Ordinal = _ied->Base + i;
 
 		// If the address is located in the export directory, then it is a forwarded export.
 		image_data_directory export_dir = _ioh->directories[IMAGE_DIRECTORY_ENTRY_EXPORT];
@@ -662,12 +711,16 @@ bool PE::_parse_exports()
 			if (!offset || !utils::read_string_at_offset(_file_handle.get(), offset, ex->ForwardName))
 			{
 				PRINT_ERROR << "Could not read a forwarded export name." << DEBUG_INFO_INSIDEPE << std::endl;
-				return false;
+				return true;
 			}
 		}
 
 		_exports.push_back(ex);
 	}
+
+    if (_ied->NumberOfNames == 0) {
+        return true;
+    }
 
 	// Associate possible exported names with the RVAs we just obtained. First, read the name and ordinal table.
 	boost::scoped_array<boost::uint32_t> names;
@@ -675,52 +728,50 @@ bool PE::_parse_exports()
 	try
 	{
 		// ied.NumberOfNames is an untrusted value. Allocate in a try-catch block to prevent crashes. See issue #1.
-		names.reset(new boost::uint32_t[ied.NumberOfNames]);
-		ords.reset(new boost::uint16_t[ied.NumberOfNames]);
+		names.reset(new boost::uint32_t[_ied->NumberOfNames]);
+		ords.reset(new boost::uint16_t[_ied->NumberOfNames]);
 	}
 	catch (const std::bad_alloc&)
 	{
 		PRINT_ERROR << "Could not allocate an array big enough to hold exported name RVAs. This PE may have been manually crafted."
 					<< DEBUG_INFO_INSIDEPE << std::endl;
-		return false;
+		return true;
 	}
-	offset = rva_to_offset(ied.AddressOfNames);
+	offset = rva_to_offset(_ied->AddressOfNames);
 	if (!offset || fseek(_file_handle.get(), offset, SEEK_SET))
 	{
 		PRINT_ERROR << "Could not reach exported function's name table." << DEBUG_INFO_INSIDEPE << std::endl;
-		return false;
+		return true;
 	}
 
-	if (ied.NumberOfNames * sizeof(boost::uint32_t) != fread(names.get(), 1, ied.NumberOfNames * sizeof(boost::uint32_t), _file_handle.get()))
+	if (_ied->NumberOfNames * sizeof(boost::uint32_t) != fread(names.get(), 1, _ied->NumberOfNames * sizeof(boost::uint32_t), _file_handle.get()))
 	{
 		PRINT_ERROR << "Could not read an exported function's name address." << DEBUG_INFO_INSIDEPE << std::endl;
-		return false;
+		return true;
 	}
 
-	offset = rva_to_offset(ied.AddressOfNameOrdinals);
+	offset = rva_to_offset(_ied->AddressOfNameOrdinals);
 	if (!offset || fseek(_file_handle.get(), offset, SEEK_SET))
 	{
 		PRINT_ERROR << "Could not reach exported functions NameOrdinals table." << DEBUG_INFO_INSIDEPE << std::endl;
-		return false;
+		return true;
 	}
-	if (ied.NumberOfNames * sizeof(boost::uint16_t) != fread(ords.get(), 1, ied.NumberOfNames * sizeof(boost::uint16_t), _file_handle.get()))
+	if (_ied->NumberOfNames * sizeof(boost::uint16_t) != fread(ords.get(), 1, _ied->NumberOfNames * sizeof(boost::uint16_t), _file_handle.get()))
 	{
 		PRINT_ERROR << "Could not read an exported function's name ordinal." << DEBUG_INFO_INSIDEPE << std::endl;
-		return false;
+		return true;
 	}
 
 	// Now match the names with with the exported addresses.
-	for (unsigned int i = 0 ; i < ied.NumberOfNames ; ++i)
+	for (unsigned int i = 0 ; i < _ied->NumberOfNames ; ++i)
 	{
 		offset = rva_to_offset(names[i]);
 		if (!offset || ords[i] >= _exports.size() || !utils::read_string_at_offset(_file_handle.get(), offset, _exports.at(ords[i])->Name))
 		{
 			PRINT_ERROR << "Could not match an export name with its address!" << DEBUG_INFO_INSIDEPE << std::endl;
-			return false;
+			return true;
 		}
 	}
-
-	_ied.reset(ied);
 	return true;
 }
 
@@ -843,7 +894,7 @@ bool PE::_parse_tls()
  *	@param	read_bytes	The number of bytes read so far, will be incremented.
  *	
  *	@return	Whether the value should be read. If false, EOF has been reached or
- *			the stucture has no more fields to read.
+ *			the structure has no more fields to read.
  */
 bool read_config_field(const			image_load_config_directory& config,
 					   FILE*			source,
@@ -1021,6 +1072,71 @@ bool PE::_parse_certificates()
 		}
 	}
 
+	return true;
+}
+
+// ----------------------------------------------------------------------------
+
+bool PE::_parse_rich_header()
+{
+	if (!_h_dos || _file_handle == nullptr) {
+		return false;
+	}
+
+	// Start searching for the RICH header at offset 0, but before the PE header.
+	if (fseek(_file_handle.get(), 0, SEEK_SET))	{
+		return true;
+	}
+
+	unsigned int read;
+	int bytes_left = _h_dos->e_lfanew;
+
+	do
+	{
+		if (1 != fread(&read, 4, 1, _file_handle.get())) {
+			break;
+		}
+		bytes_left -= 4;  // Stay between offset 0x80 and the PE header.
+	} while (read != 0x68636952 && bytes_left > 0);
+
+	if (read != 0x68636952)	{
+		return true;  // The RICH magic was not found.
+	}
+	rich_header h;
+	if (1 != fread(&h.xor_key, 4, 1, _file_handle.get())) 
+	{
+		PRINT_WARNING << "XOR key absent after the RICH header!" << DEBUG_INFO_INSIDEPE << std::endl;
+		return true;
+	}
+
+	// Start parsing the values backwards.
+	while (true)
+	{
+		if (fseek(_file_handle.get(), -16, SEEK_CUR)) 
+		{
+			PRINT_WARNING << "Error while reading the RICH header!" << DEBUG_INFO_INSIDEPE << std::endl;
+			return true;
+		}
+		boost::uint64_t data;
+		if (1 != fread(&data, 8, 1, _file_handle.get())) 
+		{
+			PRINT_WARNING << "Error while reading the RICH header!" << DEBUG_INFO_INSIDEPE << std::endl;
+			return true;
+		}
+		boost::uint32_t count = (data >> 32) ^ h.xor_key;
+		boost::uint32_t id_value = (data & 0xFFFFFFFF) ^ h.xor_key;
+
+		// Stop if we reach the start marker, "DanS".
+		if (id_value == 0x536E6144) {
+			break;
+		}
+		auto t = std::make_tuple(static_cast<boost::uint16_t>((id_value >> 16) & 0xFFFF), static_cast<boost::uint16_t>(id_value & 0xFFFF), count);
+		h.values.insert(h.values.begin(), t);
+	};
+
+	// Keep a trace of where this header starts, as it is not easy to locate and is useful to calculate the checksum.
+	h.file_offset = ftell(_file_handle.get()) - 8;
+	_rich_header.reset(h);
 	return true;
 }
 

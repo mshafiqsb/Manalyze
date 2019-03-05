@@ -15,19 +15,21 @@ You should have received a copy of the GNU General Public License
 along with Manalyze.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include <iomanip>
+
 #include "manacommons/output_tree_node.h"
 
 namespace io
 {
 
-unsigned int determine_max_width(pNode node)
+size_t determine_max_width(pNode node)
 {
 	if (node->get_type() != OutputTreeNode::LIST)
 	{
 		PRINT_WARNING << "[RawFormatter] Tried to get the maximum width, but is not a list of nodes!" << std::endl;
 		return 0;
 	}
-	unsigned int max = 0;
+	size_t max = 0;
 	pNodes children = node->get_children();
 	for (nodes::const_iterator it = children->begin() ; it != children->end() ; ++it)
 	{
@@ -103,8 +105,23 @@ pString OutputTreeNode::to_string() const
 	}
 
 	std::stringstream ss;
-	if (_modifier == HEX) {
-		ss << std::hex << "0x";
+	if (_modifier == HEX)
+	{
+		ss << std::hex << "0x" << std::uppercase << std::setfill('0');
+        switch (_type)
+        {
+            case UINT32:
+                ss << std::setw(8);
+                break;
+            case UINT16:
+                ss << std::setw(4);
+                break;
+            case UINT64:
+                ss << std::setw(16);
+                break;
+            default:
+                break;
+        }
 	}
 	else if (_modifier == DEC) {
 		ss << std::dec;
@@ -232,7 +249,7 @@ pNodes OutputTreeNode::get_children() const
 
 // ----------------------------------------------------------------------------
 
-unsigned int OutputTreeNode::size() const
+size_t OutputTreeNode::size() const
 {
 	if (_type != LIST)
 	{

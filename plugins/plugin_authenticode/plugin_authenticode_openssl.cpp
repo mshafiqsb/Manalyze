@@ -15,26 +15,10 @@
     along with Manalyze.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include <boost/shared_ptr.hpp>
-
-#include <openssl/pkcs7.h>
-#include <openssl/x509.h>
-#include <openssl/bio.h>
-
-#include "plugin_framework/plugin_interface.h"
-
-typedef boost::shared_ptr<PKCS7>  pPKCS7;
-typedef boost::shared_ptr<BIO>    pBIO;
+#include "plugins/plugin_authenticode/plugin_authenticode_openssl.h"
 
 namespace plugin
 {
-
-/**
- *	@brief	Looks for well-known company names in the RT_VERSION resource of the PE.
- *
- *	Defined in plugin_authenticode_common.cpp.
- */
-void check_version_info(const mana::PE& pe, pResult res);
 
 /**
  *  @brief  Returns the contents of an OpenSSL BIO as a string.
@@ -43,7 +27,7 @@ void check_version_info(const mana::PE& pe, pResult res);
  *
  *  @return A string containing the contents of the BIO.
  */
-std::string bio_to_string(pBIO bio)
+std::string bio_to_string(const pBIO& bio)
 {
     BUF_MEM* buf = nullptr; // The memory pointed by this is freed with the BIO.
     BIO_get_mem_ptr(bio.get(), &buf);
@@ -112,18 +96,37 @@ std::string get_CN(const std::string& x509_name)
 // ----------------------------------------------------------------------------
 
 /**
+ * Function which converts a byte array into an hexadecimal string.
+ * @param buffer The byte array to convert.
+ * @return An hexadecimal representation of the input data.
+ */
+std::string hexlify(const bytes& buffer)
+{
+    std::string result;
+    for (const auto& b : buffer)
+    {
+        static const char dec2hex[17] = "0123456789abcdef";
+        result += dec2hex[(b >> 4) & 15];
+        result += dec2hex[b        & 15];
+    }
+    return result;
+}
+
+// ----------------------------------------------------------------------------
+
+/**
  *  @brief  This function navigates through the digital signature's
- *          certificate chain to retreive the successive common names.
+ *          certificate chain to retrieve the successive common names.
  *
  *  @param  pPKCS7 p The PKCS7 object containing the digital signature.
  *  @param  pResult res The result in which the names should be added.
  */
-void add_certificate_information(pPKCS7 p, pResult res)
+void add_certificate_information(const pPKCS7& p, const pResult& res)
 {
     STACK_OF(X509)* signers = PKCS7_get0_signers(p.get(), nullptr, 0);
     if (signers == nullptr)
     {
-        PRINT_WARNING << "[plugin_authenticode] Could not obtain the certificate signers." << std::endl;
+        PRINT_WARNING << "[plugin_authenticode] Could not obtain the certificate signers" << std::endl;
         return;
     }
     
@@ -134,8 +137,8 @@ void add_certificate_information(pPKCS7 p, pResult res)
         X509_NAME* subject = X509_get_subject_name(sk_X509_value(signers, i));
         std::string issuer_str = X509_NAME_to_string(issuer);
         std::string subject_str = X509_NAME_to_string(subject);
-        res->add_information("Signer: " + get_CN(subject_str) + ".");
-        res->add_information("Issuer: " + get_CN(issuer_str) + ".");
+        res->add_information("Signer: " + get_CN(subject_str));
+        res->add_information("Issuer: " + get_CN(issuer_str));
     }
     
     sk_X509_free(signers);
@@ -171,38 +174,56 @@ class OpenSSLAuthenticodePlugin : public IPlugin
         pResult res = create_result();
         
         auto certs = pe.get_certificates();
-        if (certs == nullptr || certs->size() == 0) // No authenticode signature.
+        if (certs == nullptr || certs->empty()) // No authenticode signature.
         {
 			check_version_info(pe, res);
             return res;
         }
         
-        for (auto it = certs->begin() ; it != certs->end() ; ++it)
+        for (const auto& it : *certs)
         {
             // Disregard non-PKCS7 certificates. According to the spec, they are not
             // supported by Windows.
-            if ((*it)->CertificateType != WIN_CERT_TYPE_PKCS_SIGNED_DATA) {
+            if (it->CertificateType != WIN_CERT_TYPE_PKCS_SIGNED_DATA) {
                 continue;
             }
             
             // Copy the certificate bytes into an OpenSSL BIO.
-            pBIO bio(BIO_new_mem_buf(&(*it)->Certificate[0], (*it)->Certificate.size()), BIO_free);
+            pBIO bio(BIO_new_mem_buf(&it->Certificate[0], it->Certificate.size()), BIO_free);
             if (bio == nullptr) 
             {
                 PRINT_WARNING << "[plugin_authenticode] Could not initialize a BIO." << std::endl;
                 continue;
             }
             
-            pPKCS7 p(d2i_PKCS7_bio(bio.get(), NULL), PKCS7_free);
-            if (p == nullptr)
+            pPKCS7 p(d2i_PKCS7_bio(bio.get(), nullptr), PKCS7_free);
+            if (p == nullptr || !check_pkcs_sanity(p))
             {
                 PRINT_WARNING << "[plugin_authenticode] Error reading the PKCS7 certificate." << std::endl;
                 continue;
             }
-            
+
+            AuthenticodeDigest digest;
+            if (!parse_spc_asn1(p->d.sign->contents->d.other->value.asn1_string, digest))
+            {
+                PRINT_WARNING << "[plugin_authenticode] Could not read the digest information." << std::endl;
+                continue;
+            }
+
             // The PKCS7 certificate has been loaded successfully. Perform verifications.
             add_certificate_information(p, res);
-            res->set_summary("The PE is digitally signed.");
+
+            // Verify that the authenticode hash is valid.
+            auto authenticode_check = get_authenticode_hash(pe, digest.algorithm);
+            if (!authenticode_check.empty() && authenticode_check != hexlify(digest.digest))
+            {
+                res->raise_level(MALICIOUS);
+                res->set_summary("The PE's digital signature is invalid.");
+                res->add_information("The file was modified after it was signed.");
+            }
+            else {
+                res->set_summary("The PE is digitally signed.");
+            }
             
         }
         
@@ -215,7 +236,7 @@ class OpenSSLAuthenticodePlugin : public IPlugin
 extern "C"
 {
     PLUGIN_API IPlugin* create() { return new OpenSSLAuthenticodePlugin(); }
-    PLUGIN_API void destroy(IPlugin* p) { if (p) delete p; }
+    PLUGIN_API void destroy(IPlugin* p) { delete p; }
 };
 
 } //!namespace plugin

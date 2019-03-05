@@ -64,7 +64,7 @@ typedef boost::shared_ptr<std::string> pString;
 
 namespace nt {
 
-typedef std::map<std::string, int> flag_dict;
+typedef std::map<std::string, unsigned int> flag_dict;
 
 // Exported flag translation maps. Definition in nt_values.cpp.
 extern const DECLSPEC flag_dict PE_CHARACTERISTICS;
@@ -89,6 +89,10 @@ extern const DECLSPEC flag_dict GLOBAL_FLAGS;
 extern const DECLSPEC flag_dict HEAP_FLAGS;
 extern const DECLSPEC flag_dict GUARD_FLAGS;
 
+// RICH header tables
+extern const DECLSPEC std::map<int, std::string> COMP_ID_TYPE;
+extern const DECLSPEC flag_dict COMP_ID_PRODID;
+
 /**
  *	@brief	Breaks down an integer given as input as a combination of flags.
  *
@@ -103,12 +107,12 @@ DECLSPEC const_shared_strings translate_to_flags(int value, const flag_dict& dic
 /**
  *	@brief	Looks up the flag corresponding to a given value, if any.
  *
- *	@param	int value The integer to translate
+ *	@param	unsigned int value The integer to translate
  *	@param	flag_dict& dict A map containing the list of available flags and corresponding
  *			integer values.
  *
  *	@return	The corresponding flag, or "UNKNOWN" if no match is found.
  */
-DECLSPEC pString translate_to_flag(int value, const flag_dict& dict);
+DECLSPEC pString translate_to_flag(unsigned int value, const flag_dict& dict);
 
 } // !namespace nt

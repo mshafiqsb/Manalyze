@@ -22,9 +22,6 @@
 
 #include "manape/resources.h"
 
-namespace bfs = boost::filesystem;
-
-
 namespace mana
 {
 
@@ -50,6 +47,18 @@ bool PE::_read_image_resource_directory(image_resource_directory& dir, unsigned 
 	{
 		PRINT_ERROR << "Could not read an IMAGE_RESOURCE_DIRECTORY." << DEBUG_INFO_INSIDEPE << std::endl;
 		return false;
+	}
+
+	// Do not parse corrupted tables as it will take an extremely long time.
+	// If Characteristics is not 0 (which it should always be according to the specification) and the number of entries is
+	// unusually high, assume that the file is corrupted.
+	if (dir.NumberOfIdEntries + dir.NumberOfNamedEntries > 0x100 && dir.Characteristics != 0)
+	{
+		PRINT_ERROR << "The PE's resource section is invalid or has been manually modified. Resources will not be parsed." << DEBUG_INFO_INSIDEPE << std::endl;
+		return false;
+	}
+	else if (dir.Characteristics != 0) {
+		PRINT_WARNING << "An IMAGE_RESOURCE_DIRECTORY's characteristics should always be 0. The PE may have been manually edited." << DEBUG_INFO_INSIDEPE << std::endl;
 	}
 
 	for (auto i = 0 ; i < dir.NumberOfIdEntries + dir.NumberOfNamedEntries ; ++i)
@@ -101,19 +110,25 @@ bool PE::_parse_resources()
 	}
 
 	image_resource_directory root;
-	_read_image_resource_directory(root);
+	if (!_read_image_resource_directory(root)) {
+		return false;
+	}
 
 	// Read Type directories
 	for (std::vector<pimage_resource_directory_entry>::iterator it = root.Entries.begin() ; it != root.Entries.end() ; ++it)
 	{
 		image_resource_directory type;
-		_read_image_resource_directory(type, (*it)->OffsetToData & 0x7FFFFFFF);
+		if (! _read_image_resource_directory(type, (*it)->OffsetToData & 0x7FFFFFFF)) {
+			continue;
+		}
 
 		// Read Name directory
 		for (std::vector<pimage_resource_directory_entry>::iterator it2 = type.Entries.begin() ; it2 != type.Entries.end() ; ++it2)
 		{
 			image_resource_directory name;
-			_read_image_resource_directory(name, (*it2)->OffsetToData & 0x7FFFFFFF);
+			if (!_read_image_resource_directory(name, (*it2)->OffsetToData & 0x7FFFFFFF)) {
+				continue;
+			}
 
 			// Read the IMAGE_RESOURCE_DATA_ENTRY
 			for (std::vector<pimage_resource_directory_entry>::iterator it3 = name.Entries.begin() ; it3 != name.Entries.end() ; ++it3)
@@ -143,22 +158,22 @@ bool PE::_parse_resources()
 				}
 
 				// Flatten the resource tree.
-				std::string name;
-				std::string type;
-				std::string language;
+				std::string r_name;
+				std::string r_type;
+				std::string r_language;
 				int id = 0;
 
 				// Translate resource type.
 				if ((*it)->NameOrId & 0x80000000) {// NameOrId is an offset to a string, we already recovered it
-					type = (*it)->NameStr;
+					r_type = (*it)->NameStr;
 				}
 				else { // Otherwise, it's a MAKERESOURCEINT constant.
-					type = *nt::translate_to_flag((*it)->NameOrId, nt::RESOURCE_TYPES);
+					r_type = *nt::translate_to_flag((*it)->NameOrId, nt::RESOURCE_TYPES);
 				}
 
 				// Translate resource name
 				if ((*it2)->NameOrId & 0x80000000) {
-					name = (*it2)->NameStr;
+					r_name = (*it2)->NameStr;
 				}
 				else {
 					id = (*it2)->NameOrId;
@@ -166,10 +181,10 @@ bool PE::_parse_resources()
 
 				// Translate the language.
 				if ((*it3)->NameOrId & 0x80000000) {
-					language = (*it3)->NameStr;
+					r_language = (*it3)->NameStr;
 				}
 				else {
-					language = *nt::translate_to_flag((*it3)->NameOrId, nt::LANG_IDS);
+					r_language = *nt::translate_to_flag((*it3)->NameOrId, nt::LANG_IDS);
 				}
 
 				offset = rva_to_offset(entry.OffsetToData);
@@ -180,7 +195,7 @@ bool PE::_parse_resources()
 						std::cerr << id;
 					}
 					else {
-						std::cerr << name;
+						std::cerr << r_name;
 					}
 					std::cerr << ". Trying to use the RVA as an offset..." << DEBUG_INFO_INSIDEPE << std::endl;
 					offset = entry.OffsetToData;
@@ -188,8 +203,8 @@ bool PE::_parse_resources()
 				pResource res;
 				if (entry.Size == 0)
 				{
-					if (name != "") {
-						PRINT_WARNING << "Resource " << name << " has a size of 0!" << DEBUG_INFO_INSIDEPE << std::endl;
+					if (r_name != "") {
+						PRINT_WARNING << "Resource " << r_name << " has a size of 0!" << DEBUG_INFO_INSIDEPE << std::endl;
 					}
 					else {
 						PRINT_WARNING << "Resource " << id << " has a size of 0!" << DEBUG_INFO_INSIDEPE << std::endl;
@@ -213,24 +228,26 @@ bool PE::_parse_resources()
 					continue;
 				}
 
-				if (name != "")
+				if (r_name != "")
 				{
-					res = boost::make_shared<Resource>(type,
-													   name,
-													   language,
+					res = boost::make_shared<Resource>(r_type,
+													   r_name,
+													   r_language,
 													   entry.Codepage,
 													   entry.Size,
+													   name.TimeDateStamp,
 													   offset,
 													   _path);
 				}
 				else { // No name: call the constructor with the resource ID instead.
-					res = boost::make_shared<Resource>(type,
-													  id,
-													  language,
-													  entry.Codepage,
-													  entry.Size,
-													  offset,
-													  _path);
+					res = boost::make_shared<Resource>(r_type,
+													   id,
+													   r_language,
+													   entry.Codepage,
+													   entry.Size,
+													   name.TimeDateStamp,
+													   offset,
+													   _path);
 				}
 
 				_resource_table.push_back(res);
@@ -248,7 +265,7 @@ shared_bytes Resource::get_raw_data() const
 	auto res = boost::make_shared<std::vector<boost::uint8_t> >();
 
 	FILE* f = _reach_data();
-	unsigned int read_bytes;
+	size_t read_bytes;
 	if (f == nullptr) {
 		goto END;
 	}
@@ -424,10 +441,10 @@ DECLSPEC pgroup_icon_directory Resource::interpret_as()
 		}
 		else // Cursors have a different structure. Adapt it to a .ico.
 		{
-			// I know I am casting bytes to shorts here. I'm not proud of it.
 			fread(&(entry->Width), 1, sizeof(boost::uint8_t), f);
 			fseek(f, 1, SEEK_CUR);
 			fread(&(entry->Height), 1, sizeof(boost::uint8_t), f);
+            entry->Height /= 2; // For some reason, twice the actual height is stored here.
 			fseek(f, 1, SEEK_CUR);
 			fread(&(entry->Planes), 1, sizeof(boost::uint16_t), f);
 			fread(&(entry->BitCount), 1, sizeof(boost::uint16_t), f);
@@ -662,7 +679,10 @@ std::vector<boost::uint8_t> reconstruct_icon(pgroup_icon_directory directory, co
 		pResource icon = pResource();
 		for (auto it = resources.begin(); it != resources.end(); ++it)
 		{
-			if ((*it)->get_id() == directory->Entries[i]->Id)
+            auto type = (*it)->get_type();
+            // Because there can be duplicate resource IDs, only consider the ones exhibiting the right type.
+			if ((*it)->get_id() == directory->Entries[i]->Id && type &&
+                ((*type == "RT_ICON" && directory->Type == 1) || (*type == "RT_CURSOR" && directory->Type == 2)))
 			{
 				icon = *it;
 				break;
@@ -679,7 +699,7 @@ std::vector<boost::uint8_t> reconstruct_icon(pgroup_icon_directory directory, co
 			   directory->Entries[i].get(),
 			   sizeof(group_icon_directory_entry) - sizeof(boost::uint32_t)); // Don't copy the last field.
 		// Fix the icon_directory_entry with the offset in the file instead of a RT_ICON id
-		unsigned long size_fix = res.size();
+		size_t size_fix = res.size();
 		memcpy(&res[3 * sizeof(boost::uint16_t) + (i+1) * sizeof(group_icon_directory_entry) - sizeof(boost::uint32_t)],
 			   &size_fix,
 			   sizeof(boost::uint32_t));
@@ -687,8 +707,12 @@ std::vector<boost::uint8_t> reconstruct_icon(pgroup_icon_directory directory, co
 		if (directory->Type == 1) { // General case for icons
 			res.insert(res.end(), icon_bytes->begin(), icon_bytes->end());
 		}
-		else if (icon_bytes->size() > 2 * sizeof(boost::uint16_t)) { // Cursors have a "hotspot" structure that we have to discard to create a valid ico.
+		else if (icon_bytes->size() > 4 && directory->Entries[i]->BytesInRes > 4) // Cursors have a "hotspot" structure that we have to discard to create a valid ico.
+        {
 			res.insert(res.end(), icon_bytes->begin() + 2 * sizeof(boost::uint16_t), icon_bytes->end());
+            // Remove 4 from the size to account for this suppression
+            int new_size = directory->Entries[i]->BytesInRes - 4;
+            memcpy(&res[3 * sizeof(boost::uint16_t) + i * sizeof(group_icon_directory_entry) + 8], &new_size, 4);
 		}
 		else { // Invalid cursor.
 			res.clear();
@@ -804,16 +828,15 @@ bool Resource::extract(const boost::filesystem::path& destination)
 bool Resource::icon_extract(const boost::filesystem::path& destination,
                             const std::vector<pResource>& resources)
 {
-    std::vector<boost::uint8_t> data;
     if (_type != "RT_GROUP_ICON" && _type != "RT_GROUP_CURSOR")
     {
         PRINT_WARNING << "Called icon_extract on a non-icon resource!" << std::endl;
         return extract(destination);
     }
-    data = reconstruct_icon(interpret_as<pgroup_icon_directory>(), resources);
-	if (data.size() == 0)
+    auto data = reconstruct_icon(interpret_as<pgroup_icon_directory>(), resources);
+	if (data.empty())
 	{
-		PRINT_WARNING << "Resource " << _name << " is empty!" << DEBUG_INFO << std::endl;
+		PRINT_WARNING << "Resource " << _id << " is empty!" << DEBUG_INFO << std::endl;
 		return true;
 	}
 

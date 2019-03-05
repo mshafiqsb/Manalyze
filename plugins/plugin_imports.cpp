@@ -22,6 +22,7 @@
 #include "plugin_framework/auto_register.h"
 
 #include "manacommons/color.h"
+#include <yara/atoms.h>
 
 namespace plugin {
 
@@ -32,20 +33,19 @@ enum REQUIREMENT { AT_LEAST_ONE = 1, AT_LEAST_TWO = 2, AT_LEAST_THREE = 3 };
 std::string anti_debug =
 	"FindWindow(A|W)|(Zw|Nt)QuerySystemInformation|DbgBreakPoint|DbgPrint|"
 	"CheckRemoteDebuggerPresent|CreateToolhelp32Snapshot|Toolhelp32ReadProcessMemory|"
-	"OutputDebugString|SwitchToThread|NtQueryInformationProcess"	// Standard anti-debug API calls
-	"QueryPerformanceCounter";	// Techniques based on timing. GetTickCount ignored (too many false positives)
+	"OutputDebugString|SwitchToThread|NtQueryInformationProcess";	// Standard anti-debug API calls
 
-std::string vanilla_injection = "VirtualAlloc.*|WriteProcessMemory|CreateRemoteThread(Ex)?|OpenProcess";
+std::string vanilla_injection = "(Nt)?VirtualAlloc.*|(Nt)?WriteProcessMemory|CreateRemoteThread(Ex)?|(Nt)?OpenProcess";
 
-std::string process_hollowing = "WriteProcessMemory|(Wow64)?SetThreadContext|ResumeThread";
+std::string process_hollowing = "(Nt)?WriteProcessMemory|(Nt)?WriteVirtualMemory|(Wow64)?SetThreadContext|(Nt)?ResumeThread|(Nt)?SetContextThread";
 
 std::string power_loader = "FindWindow(A|W)|GetWindowLong(A|W)";
 
 std::string atom_bombing = "GlobalAddAtom(A|W)|GlobalGetAtomName(A|W)|QueueUserAPC";
 
-std::string process_doppelganging = "CreateTransaction|CreateFileTransacted|RollbackTransaction|WriteFile";
+std::string process_doppelganging = "CreateTransaction|CreateFileTransacted|RollbackTransaction|(Nt)?WriteFile";
 
-std::string keylogger_api = "SetWindowsHook(Ex)?|GetAsyncKeyState|GetForegroundWindow|AttachThreadInput|CallNextHook(Ex)?|MapVirtualKey";
+std::string keylogger_api = "SetWindowsHook(Ex)?|GetAsyncKeyState|GetForegroundWindow|AttachThreadInput|CallNextHook(Ex)?|MapVirtualKey(A|W|Ex)";
 
 std::string raw_socket_api = "accept|bind|connect|recv|send|gethost(by)?name|inet_addr";
 
@@ -53,9 +53,9 @@ std::string http_api = "Internet.*|URL(Download|Open).*|WinHttp.*";
 
 std::string registry_api = "Reg.*(Key|Value).*|SH.*(Reg|Key).*|SHQueryValueEx(A|W)|SHGetValue(A|W)";
 
-std::string process_creation_api = "CreateProcess.*|system|WinExec|ShellExecute(A|W)";
+std::string process_creation_api = "(Nt)?CreateProcess.*|system|WinExec|ShellExecute(A|W)";
 
-std::string process_manipulation_api = "EnumProcess.*|OpenProcess|(Read|Write)ProcessMemory|Process32(First|Next)(A|W)?";
+std::string process_manipulation_api = "EnumProcess.*|(Nt)?OpenProcess|(Nt)?(Read|Write)ProcessMemory|Process32(First|Next)(A|W)?";
 
 std::string service_manipulation_api = "OpenSCManager(A|W)|(Open|Control|Create|Delete)Service(A|W)?|QueryService.*|"
 									   "ChangeServiceConfig(A|W)|EnumServicesStatus(Ex)?(A|W)";
@@ -68,7 +68,7 @@ std::string dacl_api = "SetKernelObjectSecurity|SetFileSecurity(A|W)|SetNamedSec
 
 std::string dynamic_import = "(Co)?LoadLibrary(Ex)?(A|W)|GetProcAddress|LdrLoadDll|MmGetSystemRoutineAddress";
 
-std::string packer_api = "VirtualAlloc(Ex)?|VirtualProtect(Ex)?";
+std::string packer_api = "(Nt)?VirtualAlloc(Ex)?|(Nt)?VirtualProtect(Ex)?";
 
 std::string temporary_files = "GetTempPath(A|W)|(Create|Write)File(A|W)";
 
@@ -91,17 +91,16 @@ std::string networking_api = "(Un)?EnableRouter|SetAdapterIpAddress|SetIp(Forwar
 /**
  *	@brief Counts the number of different function names in a vector.
  *
- *	A, W and Ex variants of the same function are considered to be the same.
+ *	A, W, Ex and Nt/Zw variants of the same function are considered to be the same.
  *
  *	@param v The vector containing the function names.
  *
  *	@return The number of different functions in the vector.
  */
-unsigned int count_functions(const std::vector<std::string>& v)
+size_t count_functions(const std::vector<std::string>& v)
 {
-	unsigned int count = 0;
 	std::set<std::string> string_set;
-	for (std::string s : v)
+	for (const std::string& s : v)
 	{
 		if (s.empty()) {
 			continue;
@@ -113,6 +112,9 @@ unsigned int count_functions(const std::vector<std::string>& v)
 		if (tmp.size() > 2 && boost::algorithm::ends_with(tmp, "Ex")) {
 			tmp = tmp.substr(0, tmp.size() - 2);
 		}
+        if (tmp.size() > 2 && (boost::algorithm::starts_with(tmp, "Nt") || boost::algorithm::starts_with(tmp, "Zw"))) {
+            tmp = tmp.substr(2, tmp.size());
+        }
 		string_set.insert(tmp);
 	}
 	return string_set.size();
@@ -143,7 +145,7 @@ bool check_functions(const mana::PE& pe,
 					 REQUIREMENT req,
 					 pResult res)
 {
-	mana::const_shared_strings found_imports = pe.find_imports(func_regex);
+	auto found_imports = pe.find_imports(func_regex);
 	if (found_imports && count_functions(*found_imports) >= static_cast<unsigned int>(req))  // Safe cast: these are positive enum indexes
 	{
 		res->raise_level(level);
@@ -151,8 +153,8 @@ bool check_functions(const mana::PE& pe,
 																io::OutputTreeNode::STRINGS,
 																io::OutputTreeNode::NEW_LINE);
 
-		for (auto it = found_imports->begin() ; it != found_imports->end() ; ++it) {
-			info->append(*it);
+		for (const auto& it : *found_imports) {
+			info->append(it);
 		}
 		res->add_information(info);
 		return true;
@@ -181,14 +183,14 @@ bool check_dlls(const mana::PE& pe,
 				pResult res)
 {
 	mana::const_shared_strings found_imports = pe.find_imports(".*", dll_regex);
-	if (found_imports->size() > 0)
+	if (!found_imports->empty())
 	{
 		res->raise_level(level);
 		io::pNode info = boost::make_shared<io::OutputTreeNode>(description,
 																io::OutputTreeNode::STRINGS,
 																io::OutputTreeNode::NEW_LINE);
-		for (auto it = found_imports->begin(); it != found_imports->end(); ++it) {
-			info->append(*it);
+		for (const auto& it : *found_imports) {
+			info->append(it);
 		}
 		res->add_information(info);
 		return true;
@@ -221,9 +223,9 @@ public:
 		check_functions(pe, power_loader, MALICIOUS, "Code injection capabilities (PowerLoader)", AT_LEAST_TWO, res);
 		check_functions(pe, atom_bombing, MALICIOUS, "Code injection capabilities (atom bombing)", AT_LEAST_THREE, res);
 		check_functions(pe, process_doppelganging, MALICIOUS, "Code injection capabilities (process doppelganging)", AT_LEAST_THREE, res);
-		check_functions(pe, "", NO_OPINION, "Can access the registry", AT_LEAST_ONE, res);
+		check_functions(pe, registry_api, NO_OPINION, "Can access the registry", AT_LEAST_ONE, res);
 		check_functions(pe, process_creation_api, NO_OPINION, "Possibly launches other programs", AT_LEAST_ONE, res);
-		check_functions(pe, "(Nt|Zw).*", SUSPICIOUS, "Uses Windows' Native API", AT_LEAST_TWO, res);
+		check_functions(pe, "(Nt|Zw).*", SUSPICIOUS, "Uses Windows's Native API", AT_LEAST_TWO, res);
 		check_functions(pe, "Crypt.*", NO_OPINION, "Uses Microsoft's cryptographic API", AT_LEAST_ONE, res);
 		check_functions(pe, temporary_files, NO_OPINION, "Can create temporary files", AT_LEAST_TWO, res);
 		check_functions(pe, "Wlx.*", MALICIOUS, "Possibly attempts GINA replacement", AT_LEAST_THREE, res);
@@ -240,7 +242,7 @@ public:
 		check_functions(pe, eventlog_deletion, MALICIOUS, "Deletes entries from the event log", AT_LEAST_ONE, res);
 		check_functions(pe, dacl_api, SUSPICIOUS, "Changes object ACLs", AT_LEAST_ONE, res);
 		check_functions(pe, screenshot_api, SUSPICIOUS, "Can take screenshots", AT_LEAST_TWO, res);
-		check_functions(pe, audio_api, SUSPICIOUS, "Can use the microphone to record audio.", AT_LEAST_ONE, res);
+		check_functions(pe, audio_api, SUSPICIOUS, "Can use the microphone to record audio", AT_LEAST_ONE, res);
 		check_functions(pe, networking_api, SUSPICIOUS, "Modifies the network configuration", AT_LEAST_ONE, res);
 		check_functions(pe, "GetClipboardData", NO_OPINION, "Reads the contents of the clipboard", AT_LEAST_ONE, res);
 		check_functions(pe, "IsUserAnAdmin", NO_OPINION, "Checks if it has admin rights", AT_LEAST_ONE, res);
@@ -258,7 +260,7 @@ public:
 				res->set_summary("The PE contains functions most legitimate programs don't use.");
 				break;
 			case MALICIOUS:
-				res->set_summary("The PE contains functions mostly used by malwares.");
+				res->set_summary("The PE contains functions mostly used by malware.");
 				break;
 			default:
 				break;
